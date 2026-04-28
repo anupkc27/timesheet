@@ -60,6 +60,7 @@ class ShiftRow:
     end: str
     break_minutes: int
     rostered_day_off: bool = False
+    worked: bool = True
 
 
 def parse_time_to_datetime(base_date: date, time_text: str) -> datetime:
@@ -191,6 +192,7 @@ def parse_timesheet_text(raw_text: str, week_start: date) -> List[ShiftRow]:
                 end=match.group("end").strip(),
                 break_minutes=break_minutes,
                 rostered_day_off=False,
+                worked=True,
             )
         )
 
@@ -209,6 +211,7 @@ def sync_day_names_from_dates(rows: List[ShiftRow]) -> List[ShiftRow]:
                 end=row.end,
                 break_minutes=row.break_minutes,
                 rostered_day_off=row.rostered_day_off,
+                worked=row.worked,
             )
         )
     return synced
@@ -246,6 +249,8 @@ def calculate_hours(
 
     for row in sorted(rows, key=lambda r: r.date_value or date.min):
         if row.date_value is None:
+            continue
+        if not row.worked:
             continue
         start_dt = parse_time_to_datetime(row.date_value, row.start)
         end_dt = parse_time_to_datetime(row.date_value, row.end)
@@ -387,6 +392,7 @@ def default_rows_from_week(week_start: date) -> List[ShiftRow]:
                 end="17:00",
                 break_minutes=30,
                 rostered_day_off=False,
+                worked=True,
             )
         )
     return rows
@@ -403,6 +409,7 @@ def render_manual_editor(rows: List[ShiftRow]) -> List[ShiftRow]:
                 "end": row.end,
                 "break_minutes": row.break_minutes,
                 "rostered_day_off": row.rostered_day_off,
+                "worked": row.worked,
             }
         )
 
@@ -417,6 +424,7 @@ def render_manual_editor(rows: List[ShiftRow]) -> List[ShiftRow]:
             "end": st.column_config.TextColumn("End"),
             "break_minutes": st.column_config.NumberColumn("Break (mins)", min_value=0, step=5),
             "rostered_day_off": st.column_config.CheckboxColumn("Rostered Day Off"),
+            "worked": st.column_config.CheckboxColumn("Worked", help="Untick if you did not work this day"),
         },
         key="timesheet_editor",
     )
@@ -445,6 +453,7 @@ def render_manual_editor(rows: List[ShiftRow]) -> List[ShiftRow]:
                 end=str(row.get("end", "")).strip(),
                 break_minutes=int(row.get("break_minutes", 0) or 0),
                 rostered_day_off=bool(row.get("rostered_day_off", False)),
+                worked=bool(row.get("worked", True)),
             )
         )
     return parsed_rows
@@ -537,6 +546,7 @@ def main() -> None:
                 parsed_rows = parse_timesheet_text(raw_ocr_text, week_start)
                 if parsed_rows:
                     st.session_state["rows"] = parsed_rows
+                    st.session_state["rows_week_start"] = week_start
                 else:
                     st.warning(
                         "Could not detect valid shift lines from OCR text. "
@@ -547,13 +557,19 @@ def main() -> None:
 
     if "rows" not in st.session_state:
         st.session_state["rows"] = default_rows_from_week(week_start)
+        st.session_state["rows_week_start"] = week_start
     else:
+        stored_week_start = st.session_state.get("rows_week_start")
+        if stored_week_start != week_start:
+            st.session_state["rows"] = default_rows_from_week(week_start)
+            st.session_state["rows_week_start"] = week_start
         st.session_state["rows"] = sync_day_names_from_dates(st.session_state["rows"])
 
     st.subheader("3) Review / edit shifts")
-    st.caption("Tip: enter the Date and Day auto-updates from the calendar.")
+    st.caption("Week view: rows auto-load from selected week start date through Sunday. Untick Worked for days not worked.")
     if st.button("Reset shifts to selected week"):
         st.session_state["rows"] = default_rows_from_week(week_start)
+        st.session_state["rows_week_start"] = week_start
         st.rerun()
     edited_rows = render_manual_editor(st.session_state["rows"])
     st.session_state["rows"] = edited_rows
@@ -588,6 +604,7 @@ def main() -> None:
             "start",
             "end",
             "break_minutes",
+            "worked",
             "rostered_day_off",
             "worked_day_number",
             "raw_hours",
