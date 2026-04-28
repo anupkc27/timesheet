@@ -414,8 +414,7 @@ def render_manual_editor(rows: List[ShiftRow]) -> List[ShiftRow]:
         )
 
     def update_rows_callback():
-        edited_df = st.session_state["timesheet_editor"]
-        st.session_state["rows"] = parse_edited_dataframe(edited_df)
+        st.session_state["rows"] = parse_edited_dataframe(st.session_state["timesheet_editor"])
 
     edited_df = st.data_editor(
         pd.DataFrame(table_data),
