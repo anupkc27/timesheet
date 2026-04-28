@@ -51,6 +51,7 @@ class ShiftRow:
     start: str
     end: str
     break_minutes: int
+    rostered_day_off: bool = False
 
 
 def parse_time_to_datetime(base_date: date, time_text: str) -> datetime:
@@ -78,14 +79,22 @@ def normalize_day_name(raw_day: str) -> str:
     return ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"][idx]
 
 
-def extract_text_from_image(file_bytes: bytes) -> str:
+def extract_text_from_image(file_bytes: bytes, fast_mode: bool = True) -> str:
     if not TESSERACT_AVAILABLE:
         return ""
     image = Image.open(io.BytesIO(file_bytes))
     image = ImageOps.exif_transpose(image).convert("RGB")
     try:
         # OCR works better on high-contrast, sharpened images.
-        enlarged = image.resize((image.width * 2, image.height * 2), RESAMPLE_LANCZOS)
+        if fast_mode:
+            # Keep runtime low by limiting image size in fast mode.
+            max_side = 1800
+            scale = min(max_side / max(image.width, image.height), 1.0)
+            if scale < 1.0:
+                image = image.resize((int(image.width * scale), int(image.height * scale)), RESAMPLE_LANCZOS)
+            enlarged = image
+        else:
+            enlarged = image.resize((image.width * 2, image.height * 2), RESAMPLE_LANCZOS)
         grayscale = ImageOps.grayscale(enlarged)
         sharpened = grayscale.filter(ImageFilter.SHARPEN)
         high_contrast = ImageEnhance.Contrast(sharpened).enhance(2.0)
@@ -94,7 +103,7 @@ def extract_text_from_image(file_bytes: bytes) -> str:
         thresholded = high_contrast.point(lambda p: 255 if p > 150 else 0)
 
         # Try slight deskew rotations for non-straight photos.
-        angles = [-6, -3, 0, 3, 6]
+        angles = [0] if fast_mode else [-6, -3, 0, 3, 6]
         variants = []
         for base in [high_contrast, thresholded]:
             for angle in angles:
@@ -103,11 +112,14 @@ def extract_text_from_image(file_bytes: bytes) -> str:
 
         # Keep original as fallback.
         variants.append(image)
-        configs = [
-            "--oem 3 --psm 6",
-            "--oem 3 --psm 4",
-            "--oem 3 --psm 11 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789:-/ .",
-        ]
+        if fast_mode:
+            configs = ["--oem 3 --psm 6"]
+        else:
+            configs = [
+                "--oem 3 --psm 6",
+                "--oem 3 --psm 4",
+                "--oem 3 --psm 11 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789:-/ .",
+            ]
 
         def score_text(text: str) -> int:
             if not text:
@@ -170,6 +182,7 @@ def parse_timesheet_text(raw_text: str, week_start: date) -> List[ShiftRow]:
                 start=match.group("start").strip(),
                 end=match.group("end").strip(),
                 break_minutes=break_minutes,
+                rostered_day_off=False,
             )
         )
 
@@ -198,12 +211,13 @@ def calculate_hours(
 
     holiday_set = set(holiday_dates)
     day_off_set = set(day_off_weekdays)
-    has_two_weekday_days_off = len(day_off_set) == 2 and all(d < 5 for d in day_off_set)
 
     # Apply weekly overtime conversion on base 1x hours after the limit:
     # first tier at 1.5x, remaining at 2x.
     cumulative_base_hours = 0.0
     cumulative_weekly_excess = 0.0
+    worked_days_by_date: Dict[date, int] = {}
+    worked_day_counter = 0
 
     for row in sorted(rows, key=lambda r: r.date_value or date.min):
         if row.date_value is None:
@@ -219,6 +233,11 @@ def calculate_hours(
         total_hours -= effective_break_minutes / 60.0
         total_hours = max(total_hours, 0.0)
 
+        if total_hours > 0 and row.date_value not in worked_days_by_date:
+            worked_day_counter += 1
+            worked_days_by_date[row.date_value] = worked_day_counter
+        worked_day_number = worked_days_by_date.get(row.date_value, 0)
+
         weekday_idx = row.date_value.weekday()
         is_holiday = row.date_value in holiday_set
 
@@ -233,35 +252,24 @@ def calculate_hours(
         if is_holiday:
             public_holiday_hours = total_hours
             weighted_hours = total_hours * public_holiday_multiplier
-        elif has_two_weekday_days_off and weekday_idx in (5, 6):
-            # Special rule: when both days off are weekdays, weekend first 8h are paid as normal
-            # hours and weekend penalties are added as shift allowances.
-            weekend_normal_hours = min(total_hours, 8.0)
-            hours_1x = weekend_normal_hours
-            remaining_hours = max(total_hours - weekend_normal_hours, 0.0)
-
-            if weekday_idx == 5:
-                # Saturday allowance +50% on the first 8 normal weekend hours.
-                shift_allowance_50_hours = weekend_normal_hours
-                # Remaining Saturday hours follow Saturday penalty structure.
-                sat_tier_1_5 = min(remaining_hours, 2.0)
-                sat_tier_2x = max(remaining_hours - 2.0, 0.0)
-                hours_1_5x += sat_tier_1_5
-                hours_2x += sat_tier_2x
-            else:
-                # Sunday allowance +100% on the first 8 normal weekend hours.
-                shift_allowance_100_hours = weekend_normal_hours
-                # Remaining Sunday hours are double time.
-                hours_2x += remaining_hours
-        elif weekday_idx == 6:
-            # Sunday: all hours at double pay.
-            hours_2x = total_hours
-            weighted_hours = hours_2x * 2.0
-        elif weekday_idx == 5:
-            # Saturday: first 2 hours at 1.5x, remaining at 2x.
+        elif row.rostered_day_off and worked_day_number in (6, 7):
+            # RDO worked on 6th/7th worked day: first 2h at 1.5x, remaining at 2x.
             hours_1_5x = min(total_hours, 2.0)
             hours_2x = max(total_hours - 2.0, 0.0)
-            weighted_hours = hours_1_5x * 1.5 + hours_2x * 2.0
+        elif weekday_idx == 5:
+            # Saturday: first 8h normal, with parallel shift allowance split:
+            # first 2h at +50%, next 6h at +100%. Remaining hours are double time.
+            weekend_normal_hours = min(total_hours, 8.0)
+            hours_1x = weekend_normal_hours
+            shift_allowance_50_hours = min(weekend_normal_hours, 2.0)
+            shift_allowance_100_hours = min(max(weekend_normal_hours - 2.0, 0.0), 6.0)
+            hours_2x = max(total_hours - weekend_normal_hours, 0.0)
+        elif weekday_idx == 6:
+            # Sunday: first 8h normal with +100% shift allowance. Remaining are double time.
+            weekend_normal_hours = min(total_hours, 8.0)
+            hours_1x = weekend_normal_hours
+            shift_allowance_100_hours = weekend_normal_hours
+            hours_2x = max(total_hours - weekend_normal_hours, 0.0)
         elif weekday_idx in day_off_set:
             # Day off worked: first 2 hours at 1.5x, remaining at 2x.
             hours_1_5x = min(total_hours, 2.0)
@@ -312,6 +320,8 @@ def calculate_hours(
                 "start": row.start,
                 "end": row.end,
                 "break_minutes": effective_break_minutes,
+                "rostered_day_off": row.rostered_day_off,
+                "worked_day_number": worked_day_number,
                 "raw_hours": round(total_hours, 2),
                 "hours_1x": round(hours_1x, 2),
                 "hours_1_5x": round(hours_1_5x, 2),
@@ -351,6 +361,7 @@ def default_rows_from_week(week_start: date) -> List[ShiftRow]:
                 start="09:00",
                 end="17:00",
                 break_minutes=30,
+                rostered_day_off=False,
             )
         )
     return rows
@@ -366,6 +377,7 @@ def render_manual_editor(rows: List[ShiftRow]) -> List[ShiftRow]:
                 "start": row.start,
                 "end": row.end,
                 "break_minutes": row.break_minutes,
+                "rostered_day_off": row.rostered_day_off,
             }
         )
 
@@ -374,11 +386,12 @@ def render_manual_editor(rows: List[ShiftRow]) -> List[ShiftRow]:
         use_container_width=True,
         num_rows="dynamic",
         column_config={
-            "day": st.column_config.TextColumn("Day"),
-            "date": st.column_config.TextColumn("Date (YYYY-MM-DD)"),
+            "day": st.column_config.TextColumn("Day", disabled=True, help="Auto-filled from Date"),
+            "date": st.column_config.DateColumn("Date", format="YYYY-MM-DD"),
             "start": st.column_config.TextColumn("Start"),
             "end": st.column_config.TextColumn("End"),
             "break_minutes": st.column_config.NumberColumn("Break (mins)", min_value=0, step=5),
+            "rostered_day_off": st.column_config.CheckboxColumn("Rostered Day Off"),
         },
         key="timesheet_editor",
     )
@@ -386,19 +399,27 @@ def render_manual_editor(rows: List[ShiftRow]) -> List[ShiftRow]:
     parsed_rows: List[ShiftRow] = []
     for _, row in edited_df.iterrows():
         row_date = None
-        raw_date = str(row.get("date", "")).strip()
+        raw_date = row.get("date", "")
         if raw_date:
-            try:
-                row_date = datetime.strptime(raw_date, "%Y-%m-%d").date()
-            except ValueError:
-                row_date = None
+            if isinstance(raw_date, datetime):
+                row_date = raw_date.date()
+            elif isinstance(raw_date, date):
+                row_date = raw_date
+            else:
+                raw_date_text = str(raw_date).strip()
+                try:
+                    row_date = datetime.strptime(raw_date_text, "%Y-%m-%d").date()
+                except ValueError:
+                    row_date = None
+        resolved_day_name = day_name_from_date(row_date) if row_date else str(row.get("day", "")).strip()
         parsed_rows.append(
             ShiftRow(
-                day_name=str(row.get("day", "")).strip() or (day_name_from_date(row_date) if row_date else ""),
+                day_name=resolved_day_name,
                 date_value=row_date,
                 start=str(row.get("start", "")).strip(),
                 end=str(row.get("end", "")).strip(),
                 break_minutes=int(row.get("break_minutes", 0) or 0),
+                rostered_day_off=bool(row.get("rostered_day_off", False)),
             )
         )
     return parsed_rows
@@ -412,8 +433,10 @@ def main() -> None:
     with st.sidebar:
         st.subheader("Rules")
         st.caption(
-            "Rules: weekday 8h@1x, next 2h@1.5x, then 2x; Sat 2h@1.5x then 2x; Sun 2x; PH 2.5x. "
-            "If both days off are weekdays, weekend first 8h become normal hours with shift allowances."
+            "Rules: weekday 8h@1x, next 2h@1.5x, then 2x; "
+            "Saturday first 8h normal (+2h @50% allowance, +6h @100% allowance), then 2x; "
+            "Sunday first 8h normal (+100% allowance), then 2x; "
+            "RDO worked on 6th/7th day = first 2h@1.5x then 2x; PH 2.5x."
         )
         day_off_names = st.multiselect(
             "Day off(s) (up to 2)",
@@ -451,6 +474,7 @@ def main() -> None:
     if input_method == "Photo extract":
         st.caption("Upload an image (you can use your device camera from the file picker) and extract shifts.")
         uploaded_file = st.file_uploader("Upload or take photo", type=["png", "jpg", "jpeg"])
+        fast_ocr_mode = st.checkbox("Fast OCR mode (recommended)", value=True)
 
         c1, c2 = st.columns(2)
         with c1:
@@ -458,7 +482,8 @@ def main() -> None:
                 bytes_data = uploaded_file.read()
                 st.image(bytes_data, caption="Timesheet image", use_container_width=True)
                 if st.button("Extract data from image"):
-                    raw_ocr_text = extract_text_from_image(bytes_data)
+                    with st.spinner("Extracting text..."):
+                        raw_ocr_text = extract_text_from_image(bytes_data, fast_mode=fast_ocr_mode)
                     if raw_ocr_text.strip():
                         st.session_state["ocr_text"] = raw_ocr_text
                     else:
@@ -493,6 +518,10 @@ def main() -> None:
         st.session_state["rows"] = default_rows_from_week(week_start)
 
     st.subheader("3) Review / edit shifts")
+    st.caption("Tip: enter the Date and Day auto-updates from the calendar.")
+    if st.button("Reset shifts to selected week"):
+        st.session_state["rows"] = default_rows_from_week(week_start)
+        st.rerun()
     edited_rows = render_manual_editor(st.session_state["rows"])
     st.session_state["rows"] = edited_rows
 
@@ -526,6 +555,8 @@ def main() -> None:
             "start",
             "end",
             "break_minutes",
+            "rostered_day_off",
+            "worked_day_number",
             "raw_hours",
             "normal_hours",
             "shift_allowance_100pct_hours",
