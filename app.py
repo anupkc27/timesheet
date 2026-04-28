@@ -399,6 +399,9 @@ def default_rows_from_week(week_start: date) -> List[ShiftRow]:
 
 
 def render_manual_editor(rows: List[ShiftRow]) -> List[ShiftRow]:
+    if "timesheet_editor" in st.session_state:
+        return parse_edited_dataframe(st.session_state["timesheet_editor"])
+
     table_data = []
     for row in rows:
         table_data.append(
@@ -412,9 +415,6 @@ def render_manual_editor(rows: List[ShiftRow]) -> List[ShiftRow]:
                 "worked": row.worked,
             }
         )
-
-    def update_rows_callback():
-        st.session_state["rows"] = parse_edited_dataframe(st.session_state["timesheet_editor"])
 
     edited_df = st.data_editor(
         pd.DataFrame(table_data),
@@ -430,7 +430,6 @@ def render_manual_editor(rows: List[ShiftRow]) -> List[ShiftRow]:
             "worked": st.column_config.CheckboxColumn("Worked", help="Untick if you did not work this day"),
         },
         key="timesheet_editor",
-        on_change=update_rows_callback,
     )
 
     return parse_edited_dataframe(edited_df)
@@ -571,14 +570,19 @@ def main() -> None:
         if stored_week_start != week_start:
             st.session_state["rows"] = default_rows_from_week(week_start)
             st.session_state["rows_week_start"] = week_start
+            if "timesheet_editor" in st.session_state:
+                del st.session_state["timesheet_editor"]
 
     st.subheader("3) Review / edit shifts")
     st.caption("Week view: rows auto-load from selected week start date through Sunday. Untick Worked for days not worked.")
     if st.button("Reset shifts to selected week"):
         st.session_state["rows"] = default_rows_from_week(week_start)
         st.session_state["rows_week_start"] = week_start
+        if "timesheet_editor" in st.session_state:
+            del st.session_state["timesheet_editor"]
         st.rerun()
     edited_rows = render_manual_editor(st.session_state["rows"])
+    st.session_state["rows"] = edited_rows
 
     st.subheader("4) Calculate output hours")
     if st.button("Calculate"):
