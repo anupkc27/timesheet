@@ -563,7 +563,6 @@ def main() -> None:
         if stored_week_start != week_start:
             st.session_state["rows"] = default_rows_from_week(week_start)
             st.session_state["rows_week_start"] = week_start
-        st.session_state["rows"] = sync_day_names_from_dates(st.session_state["rows"])
 
     st.subheader("3) Review / edit shifts")
     st.caption("Week view: rows auto-load from selected week start date through Sunday. Untick Worked for days not worked.")
