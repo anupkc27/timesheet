@@ -75,7 +75,11 @@ def extract_text_from_image(file_bytes: bytes) -> str:
     if not TESSERACT_AVAILABLE:
         return ""
     image = Image.open(io.BytesIO(file_bytes))
-    return pytesseract.image_to_string(image)
+    try:
+        return pytesseract.image_to_string(image)
+    except Exception:
+        # Covers missing Tesseract binary/runtime (e.g., Streamlit Cloud without system package).
+        return ""
 
 
 def parse_timesheet_text(raw_text: str, week_start: date) -> List[ShiftRow]:
@@ -394,12 +398,15 @@ def main() -> None:
             if uploaded_file is not None:
                 bytes_data = uploaded_file.read()
                 st.image(bytes_data, caption="Timesheet image", use_container_width=True)
-                if TESSERACT_AVAILABLE:
-                    if st.button("Extract data from image"):
-                        raw_ocr_text = extract_text_from_image(bytes_data)
+                if st.button("Extract data from image"):
+                    raw_ocr_text = extract_text_from_image(bytes_data)
+                    if raw_ocr_text.strip():
                         st.session_state["ocr_text"] = raw_ocr_text
-                else:
-                    st.warning("OCR engine not installed yet. Install Tesseract on your system, then restart app.")
+                    else:
+                        st.warning(
+                            "OCR is unavailable in this environment. Please paste times manually, "
+                            "or install Tesseract OCR on the host system and restart."
+                        )
 
         with c2:
             st.subheader("2) OCR text / paste text")
