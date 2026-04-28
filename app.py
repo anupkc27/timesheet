@@ -74,7 +74,8 @@ def normalize_day_name(raw_day: str) -> str:
 def extract_text_from_image(file_bytes: bytes) -> str:
     if not TESSERACT_AVAILABLE:
         return ""
-    image = Image.open(io.BytesIO(file_bytes)).convert("RGB")
+    image = Image.open(io.BytesIO(file_bytes))
+    image = ImageOps.exif_transpose(image).convert("RGB")
     try:
         # OCR works better on high-contrast, sharpened images.
         enlarged = image.resize((image.width * 2, image.height * 2), Image.Resampling.LANCZOS)
@@ -85,8 +86,21 @@ def extract_text_from_image(file_bytes: bytes) -> str:
         # Binary threshold version for faint text.
         thresholded = high_contrast.point(lambda p: 255 if p > 150 else 0)
 
-        variants = [image, high_contrast, thresholded]
-        config = "--oem 3 --psm 6"
+        # Try slight deskew rotations for non-straight photos.
+        angles = [-6, -3, 0, 3, 6]
+        variants = []
+        for base in [high_contrast, thresholded]:
+            for angle in angles:
+                rotated = base.rotate(angle, expand=True, fillcolor=255)
+                variants.append(rotated)
+
+        # Keep original as fallback.
+        variants.append(image)
+        configs = [
+            "--oem 3 --psm 6",
+            "--oem 3 --psm 4",
+            "--oem 3 --psm 11 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789:-/ .",
+        ]
 
         def score_text(text: str) -> int:
             if not text:
@@ -95,18 +109,26 @@ def extract_text_from_image(file_bytes: bytes) -> str:
             day_hits = sum(1 for d in ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"] if d in lower)
             time_hits = len(re.findall(r"\b\d{1,2}(?::\d{2})?\s?(?:am|pm)?\b", lower))
             break_hits = len(re.findall(r"\bbreak\b", lower))
-            return day_hits * 8 + time_hits * 2 + break_hits
+            noise_penalty = len(re.findall(r"[^A-Za-z0-9:\-\s/\n\.]", text))
+            return day_hits * 8 + time_hits * 2 + break_hits - noise_penalty
 
         best_text = ""
         best_score = -1
         for v in variants:
-            extracted = pytesseract.image_to_string(v, config=config)
-            score = score_text(extracted)
-            if score > best_score:
-                best_score = score
-                best_text = extracted
+            for config in configs:
+                extracted = pytesseract.image_to_string(v, config=config)
+                score = score_text(extracted)
+                if score > best_score:
+                    best_score = score
+                    best_text = extracted
 
-        return best_text
+        cleaned_lines = []
+        for line in best_text.splitlines():
+            cleaned = re.sub(r"[^\w:\-\s/\.]", " ", line)
+            cleaned = re.sub(r"\s+", " ", cleaned).strip()
+            if cleaned:
+                cleaned_lines.append(cleaned)
+        return "\n".join(cleaned_lines)
     except Exception:
         # Covers missing Tesseract binary/runtime (e.g., Streamlit Cloud without system package).
         return ""
@@ -450,7 +472,13 @@ def main() -> None:
 
             if st.button("Parse text into shifts"):
                 parsed_rows = parse_timesheet_text(raw_ocr_text, week_start)
-                st.session_state["rows"] = parsed_rows
+                if parsed_rows:
+                    st.session_state["rows"] = parsed_rows
+                else:
+                    st.warning(
+                        "Could not detect valid shift lines from OCR text. "
+                        "Please correct/paste lines like: Monday 9:00am - 5:00pm break 30, then parse again."
+                    )
     else:
         st.caption("Enter or adjust shift rows directly in the table below.")
 
