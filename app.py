@@ -22,6 +22,14 @@ except AttributeError:
     # Pillow < 9 compatibility.
     RESAMPLE_LANCZOS = Image.LANCZOS
 
+TESSERACT_RUNTIME_AVAILABLE = False
+if TESSERACT_AVAILABLE:
+    try:
+        _ = pytesseract.get_tesseract_version()
+        TESSERACT_RUNTIME_AVAILABLE = True
+    except Exception:
+        TESSERACT_RUNTIME_AVAILABLE = False
+
 
 WEEKDAY_MAP = {
     "mon": 0,
@@ -187,6 +195,23 @@ def parse_timesheet_text(raw_text: str, week_start: date) -> List[ShiftRow]:
         )
 
     return rows
+
+
+def sync_day_names_from_dates(rows: List[ShiftRow]) -> List[ShiftRow]:
+    synced: List[ShiftRow] = []
+    for row in rows:
+        resolved_day = day_name_from_date(row.date_value) if row.date_value else row.day_name
+        synced.append(
+            ShiftRow(
+                day_name=resolved_day,
+                date_value=row.date_value,
+                start=row.start,
+                end=row.end,
+                break_minutes=row.break_minutes,
+                rostered_day_off=row.rostered_day_off,
+            )
+        )
+    return synced
 
 
 def calculate_hours(
@@ -487,10 +512,16 @@ def main() -> None:
                     if raw_ocr_text.strip():
                         st.session_state["ocr_text"] = raw_ocr_text
                     else:
-                        st.warning(
-                            "OCR is unavailable in this environment. Please paste times manually, "
-                            "or install Tesseract OCR on the host system and restart."
-                        )
+                        if not TESSERACT_RUNTIME_AVAILABLE:
+                            st.warning(
+                                "OCR is unavailable in this environment. Please paste times manually, "
+                                "or install Tesseract OCR on the host system and restart."
+                            )
+                        else:
+                            st.warning(
+                                "OCR could not read clear timesheet text from this image. "
+                                "Try a clearer/straighter photo, or turn off Fast OCR mode."
+                            )
 
         with c2:
             st.subheader("2) OCR text / paste text")
@@ -516,6 +547,8 @@ def main() -> None:
 
     if "rows" not in st.session_state:
         st.session_state["rows"] = default_rows_from_week(week_start)
+    else:
+        st.session_state["rows"] = sync_day_names_from_dates(st.session_state["rows"])
 
     st.subheader("3) Review / edit shifts")
     st.caption("Tip: enter the Date and Day auto-updates from the calendar.")
