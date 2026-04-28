@@ -115,24 +115,34 @@ def parse_timesheet_text(raw_text: str, week_start: date) -> List[ShiftRow]:
 
 def calculate_hours(
     rows: List[ShiftRow],
-    regular_daily_limit: float,
-    overtime_multiplier: float,
-    weekend_multiplier: float,
     public_holiday_multiplier: float,
     holiday_dates: List[date],
+    day_off_weekdays: List[int],
+    unpaid_break_minutes: int = 30,
+    weekly_regular_limit: float = 40.0,
+    weekly_overtime_tier1_limit: float = 2.0,
 ) -> Tuple[pd.DataFrame, Dict[str, float]]:
     output_rows = []
     totals = {
-        "regular_hours": 0.0,
-        "overtime_hours": 0.0,
-        "weekend_hours": 0.0,
+        "hours_1x": 0.0,
+        "hours_1_5x": 0.0,
+        "hours_2x": 0.0,
+        "shift_allowance_50_hours": 0.0,
+        "shift_allowance_100_hours": 0.0,
         "public_holiday_hours": 0.0,
         "weighted_total_hours": 0.0,
     }
 
     holiday_set = set(holiday_dates)
+    day_off_set = set(day_off_weekdays)
+    has_two_weekday_days_off = len(day_off_set) == 2 and all(d < 5 for d in day_off_set)
 
-    for row in rows:
+    # Apply weekly overtime conversion on base 1x hours after the limit:
+    # first tier at 1.5x, remaining at 2x.
+    cumulative_base_hours = 0.0
+    cumulative_weekly_excess = 0.0
+
+    for row in sorted(rows, key=lambda r: r.date_value or date.min):
         if row.date_value is None:
             continue
         start_dt = parse_time_to_datetime(row.date_value, row.start)
@@ -141,32 +151,94 @@ def calculate_hours(
             end_dt += timedelta(days=1)
 
         total_hours = (end_dt - start_dt).total_seconds() / 3600.0
-        total_hours -= row.break_minutes / 60.0
+        # Always deduct at least the standard unpaid 30-minute break.
+        effective_break_minutes = max(int(row.break_minutes or 0), unpaid_break_minutes)
+        total_hours -= effective_break_minutes / 60.0
         total_hours = max(total_hours, 0.0)
 
-        is_weekend = row.date_value.weekday() >= 5
+        weekday_idx = row.date_value.weekday()
         is_holiday = row.date_value in holiday_set
 
-        regular_hours = 0.0
-        overtime_hours = 0.0
-        weekend_hours = 0.0
+        hours_1x = 0.0
+        hours_1_5x = 0.0
+        hours_2x = 0.0
+        shift_allowance_50_hours = 0.0
+        shift_allowance_100_hours = 0.0
         public_holiday_hours = 0.0
         weighted_hours = 0.0
 
         if is_holiday:
             public_holiday_hours = total_hours
             weighted_hours = total_hours * public_holiday_multiplier
-        elif is_weekend:
-            weekend_hours = total_hours
-            weighted_hours = total_hours * weekend_multiplier
-        else:
-            regular_hours = min(total_hours, regular_daily_limit)
-            overtime_hours = max(total_hours - regular_daily_limit, 0.0)
-            weighted_hours = regular_hours + overtime_hours * overtime_multiplier
+        elif has_two_weekday_days_off and weekday_idx in (5, 6):
+            # Special rule: when both days off are weekdays, weekend first 8h are paid as normal
+            # hours and weekend penalties are added as shift allowances.
+            weekend_normal_hours = min(total_hours, 8.0)
+            hours_1x = weekend_normal_hours
+            remaining_hours = max(total_hours - weekend_normal_hours, 0.0)
 
-        totals["regular_hours"] += regular_hours
-        totals["overtime_hours"] += overtime_hours
-        totals["weekend_hours"] += weekend_hours
+            if weekday_idx == 5:
+                # Saturday allowance +50% on the first 8 normal weekend hours.
+                shift_allowance_50_hours = weekend_normal_hours
+                # Remaining Saturday hours follow Saturday penalty structure.
+                sat_tier_1_5 = min(remaining_hours, 2.0)
+                sat_tier_2x = max(remaining_hours - 2.0, 0.0)
+                hours_1_5x += sat_tier_1_5
+                hours_2x += sat_tier_2x
+            else:
+                # Sunday allowance +100% on the first 8 normal weekend hours.
+                shift_allowance_100_hours = weekend_normal_hours
+                # Remaining Sunday hours are double time.
+                hours_2x += remaining_hours
+        elif weekday_idx == 6:
+            # Sunday: all hours at double pay.
+            hours_2x = total_hours
+            weighted_hours = hours_2x * 2.0
+        elif weekday_idx == 5:
+            # Saturday: first 2 hours at 1.5x, remaining at 2x.
+            hours_1_5x = min(total_hours, 2.0)
+            hours_2x = max(total_hours - 2.0, 0.0)
+            weighted_hours = hours_1_5x * 1.5 + hours_2x * 2.0
+        elif weekday_idx in day_off_set:
+            # Day off worked: first 2 hours at 1.5x, remaining at 2x.
+            hours_1_5x = min(total_hours, 2.0)
+            hours_2x = max(total_hours - 2.0, 0.0)
+        else:
+            # Other days: first 8h at 1x, next 2h at 1.5x, then 2x.
+            hours_1x = min(total_hours, 8.0)
+            remaining_after_8 = max(total_hours - 8.0, 0.0)
+            hours_1_5x = min(remaining_after_8, 2.0)
+            hours_2x = max(remaining_after_8 - 2.0, 0.0)
+
+        if not is_holiday and hours_1x > 0:
+            prior_excess = max(cumulative_base_hours - weekly_regular_limit, 0.0)
+            cumulative_base_hours += hours_1x
+            new_excess_total = max(cumulative_base_hours - weekly_regular_limit, 0.0)
+            converted_from_1x = max(new_excess_total - prior_excess, 0.0)
+            converted_from_1x = min(converted_from_1x, hours_1x)
+            if converted_from_1x > 0:
+                hours_1x -= converted_from_1x
+                remaining_tier1_capacity = max(weekly_overtime_tier1_limit - cumulative_weekly_excess, 0.0)
+                tier1_allocation = min(converted_from_1x, remaining_tier1_capacity)
+                tier2_allocation = max(converted_from_1x - tier1_allocation, 0.0)
+                hours_1_5x += tier1_allocation
+                hours_2x += tier2_allocation
+                cumulative_weekly_excess += converted_from_1x
+
+        weighted_hours = (
+            hours_1x
+            + hours_1_5x * 1.5
+            + hours_2x * 2.0
+            + shift_allowance_50_hours * 0.5
+            + shift_allowance_100_hours * 1.0
+            + public_holiday_hours * public_holiday_multiplier
+        )
+
+        totals["hours_1x"] += hours_1x
+        totals["hours_1_5x"] += hours_1_5x
+        totals["hours_2x"] += hours_2x
+        totals["shift_allowance_50_hours"] += shift_allowance_50_hours
+        totals["shift_allowance_100_hours"] += shift_allowance_100_hours
         totals["public_holiday_hours"] += public_holiday_hours
         totals["weighted_total_hours"] += weighted_hours
 
@@ -176,11 +248,13 @@ def calculate_hours(
                 "date": row.date_value.isoformat(),
                 "start": row.start,
                 "end": row.end,
-                "break_minutes": row.break_minutes,
+                "break_minutes": effective_break_minutes,
                 "raw_hours": round(total_hours, 2),
-                "regular_hours": round(regular_hours, 2),
-                "overtime_hours": round(overtime_hours, 2),
-                "weekend_hours": round(weekend_hours, 2),
+                "hours_1x": round(hours_1x, 2),
+                "hours_1_5x": round(hours_1_5x, 2),
+                "hours_2x": round(hours_2x, 2),
+                "shift_allowance_50_hours": round(shift_allowance_50_hours, 2),
+                "shift_allowance_100_hours": round(shift_allowance_100_hours, 2),
                 "public_holiday_hours": round(public_holiday_hours, 2),
                 "weighted_hours": round(weighted_hours, 2),
             }
@@ -270,13 +344,27 @@ def render_manual_editor(rows: List[ShiftRow]) -> List[ShiftRow]:
 def main() -> None:
     st.set_page_config(page_title="Timesheet Photo Extractor", layout="wide")
     st.title("Timesheet Photo Extractor + Rules Engine")
-    st.caption("Upload or take a photo of your timesheet, extract shifts, and calculate hours by your pay rules.")
+    st.caption("Use manual entry or photo extraction, then adjust shifts and calculate hours by your pay rules.")
 
     with st.sidebar:
         st.subheader("Rules")
-        regular_daily_limit = st.number_input("Regular daily hours", min_value=0.0, max_value=24.0, value=8.0, step=0.5)
-        overtime_multiplier = st.number_input("Overtime multiplier", min_value=1.0, max_value=5.0, value=1.5, step=0.1)
-        weekend_multiplier = st.number_input("Weekend multiplier", min_value=1.0, max_value=5.0, value=1.5, step=0.1)
+        st.caption(
+            "Rules: weekday 8h@1x, next 2h@1.5x, then 2x; Sat 2h@1.5x then 2x; Sun 2x; PH 2.5x. "
+            "If both days off are weekdays, weekend first 8h become normal hours with shift allowances."
+        )
+        day_off_names = st.multiselect(
+            "Day off(s) (up to 2)",
+            options=["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"],
+            default=[],
+        )
+        if len(day_off_names) > 2:
+            st.warning("Please select at most 2 days off.")
+            day_off_names = day_off_names[:2]
+        unpaid_break_minutes = st.number_input("Unpaid break per shift (mins)", min_value=0, max_value=240, value=30, step=5)
+        weekly_regular_limit = st.number_input("Weekly regular-hour limit", min_value=0.0, max_value=168.0, value=40.0, step=1.0)
+        weekly_overtime_tier1_limit = st.number_input(
+            "Weekly overtime @1.5x hours (after limit)", min_value=0.0, max_value=40.0, value=2.0, step=0.5
+        )
         public_holiday_multiplier = st.number_input(
             "Public holiday multiplier", min_value=1.0, max_value=5.0, value=2.5, step=0.1
         )
@@ -287,72 +375,108 @@ def main() -> None:
             help="Example:\n2026-01-01\n2026-04-25",
         )
 
-    st.subheader("1) Add your timesheet image")
-    uploaded_file = st.file_uploader("Upload photo", type=["png", "jpg", "jpeg"])
-    camera_file = st.camera_input("Or take photo")
-    selected_file = camera_file or uploaded_file
+    st.subheader("1) Timesheet input")
+    input_method = st.radio(
+        "Choose input method",
+        options=["Photo extract", "Manual entry"],
+        horizontal=True,
+    )
 
-    raw_ocr_text = ""
+    raw_ocr_text = st.session_state.get("ocr_text", "")
     parsed_rows: List[ShiftRow] = []
 
-    c1, c2 = st.columns(2)
-    with c1:
-        if selected_file is not None:
-            bytes_data = selected_file.read()
-            st.image(bytes_data, caption="Timesheet image", use_container_width=True)
-            if TESSERACT_AVAILABLE:
-                if st.button("Extract data from image"):
-                    raw_ocr_text = extract_text_from_image(bytes_data)
-                    st.session_state["ocr_text"] = raw_ocr_text
-            else:
-                st.warning("OCR engine not installed yet. Install Tesseract on your system, then restart app.")
+    if input_method == "Photo extract":
+        st.caption("Upload an image (you can use your device camera from the file picker) and extract shifts.")
+        uploaded_file = st.file_uploader("Upload or take photo", type=["png", "jpg", "jpeg"])
 
-        if "ocr_text" in st.session_state:
-            raw_ocr_text = st.session_state["ocr_text"]
+        c1, c2 = st.columns(2)
+        with c1:
+            if uploaded_file is not None:
+                bytes_data = uploaded_file.read()
+                st.image(bytes_data, caption="Timesheet image", use_container_width=True)
+                if TESSERACT_AVAILABLE:
+                    if st.button("Extract data from image"):
+                        raw_ocr_text = extract_text_from_image(bytes_data)
+                        st.session_state["ocr_text"] = raw_ocr_text
+                else:
+                    st.warning("OCR engine not installed yet. Install Tesseract on your system, then restart app.")
 
-    with c2:
-        st.subheader("2) OCR text / paste text")
-        raw_ocr_text = st.text_area(
-            "Detected text",
-            value=raw_ocr_text,
-            height=250,
-            help="You can correct OCR text manually. Expected line pattern example: Monday 9:00am - 5:00pm break 30",
-        )
+        with c2:
+            st.subheader("2) OCR text / paste text")
+            raw_ocr_text = st.text_area(
+                "Detected text",
+                value=raw_ocr_text,
+                height=250,
+                help="You can fix OCR errors here before parsing. Example: Monday 9:00am - 5:00pm break 30",
+            )
+            st.session_state["ocr_text"] = raw_ocr_text
 
-        if st.button("Parse text into shifts"):
-            parsed_rows = parse_timesheet_text(raw_ocr_text, week_start)
-            st.session_state["rows"] = parsed_rows
+            if st.button("Parse text into shifts"):
+                parsed_rows = parse_timesheet_text(raw_ocr_text, week_start)
+                st.session_state["rows"] = parsed_rows
+    else:
+        st.caption("Enter or adjust shift rows directly in the table below.")
 
     if "rows" not in st.session_state:
         st.session_state["rows"] = default_rows_from_week(week_start)
 
-    st.subheader("3) Review / edit extracted shifts")
+    st.subheader("3) Review / edit shifts")
     edited_rows = render_manual_editor(st.session_state["rows"])
     st.session_state["rows"] = edited_rows
 
     st.subheader("4) Calculate output hours")
     if st.button("Calculate"):
+        selected_day_offs = [WEEKDAY_MAP[d.lower()] for d in day_off_names]
         holidays = parse_holiday_dates(holiday_text)
         result_df, totals = calculate_hours(
             rows=edited_rows,
-            regular_daily_limit=regular_daily_limit,
-            overtime_multiplier=overtime_multiplier,
-            weekend_multiplier=weekend_multiplier,
             public_holiday_multiplier=public_holiday_multiplier,
             holiday_dates=holidays,
+            day_off_weekdays=selected_day_offs,
+            unpaid_break_minutes=int(unpaid_break_minutes),
+            weekly_regular_limit=float(weekly_regular_limit),
+            weekly_overtime_tier1_limit=float(weekly_overtime_tier1_limit),
         )
 
         st.success("Calculation complete")
-        st.dataframe(result_df, use_container_width=True)
+        display_df = result_df.rename(
+            columns={
+                "hours_1x": "normal_hours",
+                "hours_1_5x": "overtime_time_and_half_hours",
+                "hours_2x": "overtime_double_time_hours",
+                "shift_allowance_50_hours": "shift_allowance_50pct_hours",
+                "shift_allowance_100_hours": "shift_allowance_100pct_hours",
+            }
+        )
+        preferred_order = [
+            "day",
+            "date",
+            "start",
+            "end",
+            "break_minutes",
+            "raw_hours",
+            "normal_hours",
+            "shift_allowance_100pct_hours",
+            "shift_allowance_50pct_hours",
+            "overtime_time_and_half_hours",
+            "overtime_double_time_hours",
+            "public_holiday_hours",
+            "weighted_hours",
+        ]
+        display_cols = [c for c in preferred_order if c in display_df.columns]
+        st.dataframe(display_df[display_cols], use_container_width=True)
+        st.caption("Overtime buckets include remaining overtime hours across both weekday and weekend shifts.")
 
-        m1, m2, m3, m4, m5 = st.columns(5)
-        m1.metric("Regular", totals["regular_hours"])
-        m2.metric("Overtime", totals["overtime_hours"])
-        m3.metric("Weekend", totals["weekend_hours"])
-        m4.metric("Public Holiday", totals["public_holiday_hours"])
-        m5.metric("Weighted Total", totals["weighted_total_hours"])
+        m1, m2, m3, m4, m5, m6, m7 = st.columns(7)
+        m1.metric("Normal Hours", totals["hours_1x"])
+        m2.metric("Shift Allowance 100%", totals["shift_allowance_100_hours"])
+        m3.metric("Shift Allowance 50%", totals["shift_allowance_50_hours"])
+        m4.metric("Overtime Time & Half", totals["hours_1_5x"])
+        m5.metric("Overtime Double Time", totals["hours_2x"])
+        m6.metric("Public Holiday Hours", totals["public_holiday_hours"])
+        m7.metric("Weighted Total", totals["weighted_total_hours"])
 
-        csv_data = result_df.to_csv(index=False).encode("utf-8")
+        csv_data = display_df.to_csv(index=False).encode("utf-8")
         st.download_button("Download CSV", data=csv_data, file_name="timesheet_hours_output.csv", mime="text/csv")
 
     st.markdown(
