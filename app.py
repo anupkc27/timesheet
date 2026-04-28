@@ -6,7 +6,7 @@ from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 
 try:
     import pytesseract
@@ -74,9 +74,39 @@ def normalize_day_name(raw_day: str) -> str:
 def extract_text_from_image(file_bytes: bytes) -> str:
     if not TESSERACT_AVAILABLE:
         return ""
-    image = Image.open(io.BytesIO(file_bytes))
+    image = Image.open(io.BytesIO(file_bytes)).convert("RGB")
     try:
-        return pytesseract.image_to_string(image)
+        # OCR works better on high-contrast, sharpened images.
+        enlarged = image.resize((image.width * 2, image.height * 2), Image.Resampling.LANCZOS)
+        grayscale = ImageOps.grayscale(enlarged)
+        sharpened = grayscale.filter(ImageFilter.SHARPEN)
+        high_contrast = ImageEnhance.Contrast(sharpened).enhance(2.0)
+
+        # Binary threshold version for faint text.
+        thresholded = high_contrast.point(lambda p: 255 if p > 150 else 0)
+
+        variants = [image, high_contrast, thresholded]
+        config = "--oem 3 --psm 6"
+
+        def score_text(text: str) -> int:
+            if not text:
+                return 0
+            lower = text.lower()
+            day_hits = sum(1 for d in ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"] if d in lower)
+            time_hits = len(re.findall(r"\b\d{1,2}(?::\d{2})?\s?(?:am|pm)?\b", lower))
+            break_hits = len(re.findall(r"\bbreak\b", lower))
+            return day_hits * 8 + time_hits * 2 + break_hits
+
+        best_text = ""
+        best_score = -1
+        for v in variants:
+            extracted = pytesseract.image_to_string(v, config=config)
+            score = score_text(extracted)
+            if score > best_score:
+                best_score = score
+                best_text = extracted
+
+        return best_text
     except Exception:
         # Covers missing Tesseract binary/runtime (e.g., Streamlit Cloud without system package).
         return ""
