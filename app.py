@@ -373,7 +373,7 @@ def render_manual_editor(rows: List[ShiftRow]) -> List[ShiftRow]:
         table_data.append(
             {
                 "day": row.day_name,
-                "date": row.date_value.isoformat() if row.date_value else "",
+                "date": row.date_value,
                 "start": row.start,
                 "end": row.end,
                 "break_minutes": row.break_minutes,
