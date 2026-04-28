@@ -388,7 +388,7 @@ def default_rows_from_week(week_start: date) -> List[ShiftRow]:
             ShiftRow(
                 day_name=day_name_from_date(d),
                 date_value=d,
-                start="09:00",
+                start="7:30 AM",
                 end="17:00",
                 break_minutes=30,
                 rostered_day_off=False,
