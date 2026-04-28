@@ -16,6 +16,13 @@ except Exception:
     TESSERACT_AVAILABLE = False
 
 
+try:
+    RESAMPLE_LANCZOS = Image.Resampling.LANCZOS
+except AttributeError:
+    # Pillow < 9 compatibility.
+    RESAMPLE_LANCZOS = Image.LANCZOS
+
+
 WEEKDAY_MAP = {
     "mon": 0,
     "monday": 0,
@@ -78,7 +85,7 @@ def extract_text_from_image(file_bytes: bytes) -> str:
     image = ImageOps.exif_transpose(image).convert("RGB")
     try:
         # OCR works better on high-contrast, sharpened images.
-        enlarged = image.resize((image.width * 2, image.height * 2), Image.Resampling.LANCZOS)
+        enlarged = image.resize((image.width * 2, image.height * 2), RESAMPLE_LANCZOS)
         grayscale = ImageOps.grayscale(enlarged)
         sharpened = grayscale.filter(ImageFilter.SHARPEN)
         high_contrast = ImageEnhance.Contrast(sharpened).enhance(2.0)
