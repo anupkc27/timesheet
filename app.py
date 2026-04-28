@@ -413,6 +413,10 @@ def render_manual_editor(rows: List[ShiftRow]) -> List[ShiftRow]:
             }
         )
 
+    def update_rows_callback():
+        edited_df = st.session_state["timesheet_editor"]
+        st.session_state["rows"] = parse_edited_dataframe(edited_df)
+
     edited_df = st.data_editor(
         pd.DataFrame(table_data),
         use_container_width=True,
@@ -427,8 +431,13 @@ def render_manual_editor(rows: List[ShiftRow]) -> List[ShiftRow]:
             "worked": st.column_config.CheckboxColumn("Worked", help="Untick if you did not work this day"),
         },
         key="timesheet_editor",
+        on_change=update_rows_callback,
     )
 
+    return parse_edited_dataframe(edited_df)
+
+
+def parse_edited_dataframe(edited_df: pd.DataFrame) -> List[ShiftRow]:
     parsed_rows: List[ShiftRow] = []
     for _, row in edited_df.iterrows():
         row_date = None
@@ -571,7 +580,6 @@ def main() -> None:
         st.session_state["rows_week_start"] = week_start
         st.rerun()
     edited_rows = render_manual_editor(st.session_state["rows"])
-    st.session_state["rows"] = edited_rows
 
     st.subheader("4) Calculate output hours")
     if st.button("Calculate"):
